@@ -1,10 +1,12 @@
 package tools.model;
 
-import lombok.Builder;
 import lombok.Data;
 
 @Data
-@Builder
 public class ProducerReport {
-	private Long totalCount;
+	private long totalCount = 0;
+	
+	public void updateTotalCount(long count) {
+		totalCount += count;
+	}
 }

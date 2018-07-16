@@ -11,8 +11,9 @@ import tools.model.ProducerReport;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -36,33 +37,41 @@ public class ProducerServiceImpl implements ProducerService {
 	
 	@Override
 	public ProducerReport produce(ProducerContext context) {
-		ProducerReport.ProducerReportBuilder builder = ProducerReport.builder();
+		Instant start = Instant.now();
+		log.info("start to produce requests...");
+		ProducerReport report = new ProducerReport();
 		int batchSize = getBatchSize(context);
 		ProducerFeature pf = new ProducerFeature();
 		
 		Runnable action = () -> {
+			Instant batchStart = Instant.now();
 			CompletableFuture<Long> cf = pf.getCompletableFuture();
 			
-			try {
-				Long count = cf.get();
-				if (count >= context.getTotalCount()) {
-					cf.complete(count);
-				}
-			} catch (InterruptedException | ExecutionException e) {
-				// TODO:....
+			Long totalCount = report.getTotalCount();
+			if (totalCount >= context.getTotalCount()) {
+				cf.complete(totalCount);
 			}
 			
+			CompletableFuture<Long> newCF;
 			if (batchSize > 1) {
-				StreamEx.generate(() -> 1)
+				newCF = StreamEx.generate(() -> 1)
 						.limit(batchSize)
 						.parallel()
-						.map(n -> CompletableFuture.supplyAsync(() -> context.getProducer().produce() ? 1 : 0))
-						.forEach(pcf -> cf.thenCombineAsync(pcf, (n1, n2) -> n1 + n2));
+						.map(n -> CompletableFuture.supplyAsync(() -> context.getProducer().produce() ? 1L : 0L))
+						.foldLeft(cf, (acc, item) -> acc.thenComposeAsync(n -> item).thenApply(count -> {
+							report.updateTotalCount(count);
+							printProgress(batchSize, batchStart, Instant.now());
+							return count;
+						}));
 			} else {
-				cf.thenCombineAsync(
-						CompletableFuture.supplyAsync(() -> context.getProducer().produce() ? 1 : 0),
-						(n1, n2) -> n1 + n2);
+				newCF = cf.thenComposeAsync(n -> CompletableFuture.supplyAsync(() -> context.getProducer().produce() ? 1L : 0L)
+						.thenApply(count -> {
+							report.updateTotalCount(count);
+							printProgress(batchSize, batchStart, Instant.now());
+							return count;
+						}));
 			}
+			pf.setCompletableFuture(cf.thenCompose(n -> newCF));
 		};
 		
 		ScheduledFuture<?> sf = executor.scheduleAtFixedRate(
@@ -71,10 +80,17 @@ public class ProducerServiceImpl implements ProducerService {
 				scheduleConfig.getSchedulePeriod(),
 				scheduleConfig.getScheduleTimeUnit());
 		
-		pf.getCompletableFuture().whenComplete(
-				(n, e) -> builder.totalCount(n));
+		pf.getCompletableFuture().whenComplete((n, e) -> {
+			sf.cancel(true);
+		});
 		
-		return builder.build();
+		pf.getCompletableFuture().join();
+		log.info("end to produce requests, cost: {}", Duration.between(start, Instant.now()));
+		return report;
+	}
+	
+	private void printProgress(int batchSize, Instant start, Instant end) {
+		System.out.println(String.format("produced %d request in %d %s", batchSize, Duration.between(start, end)));
 	}
 	
 	private int getBatchSize(ProducerContext context) {
@@ -93,5 +109,6 @@ public class ProducerServiceImpl implements ProducerService {
 	@PreDestroy
 	private void destroy() {
 		log.info("PreDestroy");
+		executor.shutdownNow();
 	}
 }
